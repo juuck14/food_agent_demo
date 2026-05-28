@@ -3,10 +3,10 @@ import mimetypes
 import os
 import time
 
+import importlib
+
 import streamlit as st
 from dotenv import load_dotenv
-from google import genai
-from google.genai import types
 
 load_dotenv()
 
@@ -108,19 +108,38 @@ JSON 스키마:
 """.strip()
 
 
-def generate_with_retry(client, image_bytes, mime_type, retries=3, base_delay=3):
+def load_gemini_sdk():
+    """Load Gemini SDK modules with compatibility fallback."""
+    try:
+        genai_module = importlib.import_module("google.genai")
+        types_module = importlib.import_module("google.genai.types")
+        return genai_module, types_module, "google-genai"
+    except ModuleNotFoundError:
+        legacy_module = importlib.import_module("google.generativeai")
+        return legacy_module, None, "google-generativeai"
+
+
+def generate_with_retry(client, image_bytes, mime_type, prompt_text, sdk_types=None, sdk_kind="google-genai", retries=3, base_delay=3):
     for attempt in range(1, retries + 1):
         try:
-            return client.models.generate_content(
+            if sdk_kind == "google-genai":
+                return client.models.generate_content(
+                    model="gemini-2.5-flash",
+                    config=sdk_types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        temperature=0.2,
+                    ),
+                    contents=[
+                        sdk_types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
+                        prompt_text,
+                    ],
+                )
+
+            legacy_image_part = {"mime_type": mime_type, "data": image_bytes}
+            return client.generate_content(
                 model="gemini-2.5-flash",
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    temperature=0.2,
-                ),
-                contents=[
-                    types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
-                    prompt,
-                ],
+                contents=[prompt_text, legacy_image_part],
+                generation_config={"temperature": 0.2, "response_mime_type": "application/json"},
             )
         except Exception as e:
             err_text = str(e).lower()
@@ -159,10 +178,23 @@ if st.button("레시피 생성하기", type="primary"):
         image_bytes = uploaded_file.getvalue()
         mime_type = uploaded_file.type or mimetypes.guess_type(uploaded_file.name)[0] or "image/jpeg"
 
-        client = genai.Client(api_key=api_key)
+        genai_sdk, sdk_types, sdk_kind = load_gemini_sdk()
+
+        if sdk_kind == "google-genai":
+            client = genai_sdk.Client(api_key=api_key)
+        else:
+            genai_sdk.configure(api_key=api_key)
+            client = genai_sdk
 
         with st.spinner("Gemini가 사진을 분석하고 레시피를 생성하는 중입니다..."):
-            response = generate_with_retry(client, image_bytes, mime_type)
+            response = generate_with_retry(
+                client,
+                image_bytes,
+                mime_type,
+                prompt,
+                sdk_types=sdk_types,
+                sdk_kind=sdk_kind,
+            )
 
         raw_text = (response.text or "").strip()
 
